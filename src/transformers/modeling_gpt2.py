@@ -175,7 +175,6 @@ class Attention(nn.Module):
             w = torch.where(mask.bool(), w, self.masked_bias.to(w.dtype))
 
         if attention_mask is not None:
-            print("attention mask shape:", attention_mask.shape)
             # Apply the attention mask
             w = w + attention_mask
 
@@ -571,11 +570,8 @@ class GPT2Model(GPT2PreTrainedModel):
         length = input_ids.shape[-1]
         for batch_id in range(input_ids.shape[0]):
             t = input_ids[batch_id]
-            print("t:", t)
-            print("eos:", eos_token_id)
-            eos_indices_tensor = (t == eos_token_id).nonzero().squeeze(dim=0)
-            eos_indices_array = eos_indices_tensor.numpy()
-            print("array:", eos_indices_tensor)
+            eos_indices_tensor = (t == eos_token_id).nonzero().squeeze()
+            eos_indices_array = eos_indices_tensor.cpu().numpy()
 
             step = 0 # -> index of eos_indices_array
             i = 0 # -> output array
@@ -587,7 +583,6 @@ class GPT2Model(GPT2PreTrainedModel):
                 else:
                     step+=1
             next_array = next_array + [[int(j<=eos_indices_array[-1]) for j in range(length)] for _ in range(length - len(next_array))]
-            print(next_array)
 
             all_data.append(next_array)
 
@@ -608,8 +603,8 @@ class GPT2Model(GPT2PreTrainedModel):
         length = input_ids.shape[-1]
         for batch_id in range(input_ids.shape[0]):
             t = input_ids[batch_id]
-            eos_indices_tensor = (t == eos_token_id).nonzero().squeeze(dim=0)
-            eos_indices_array = eos_indices_tensor.numpy()
+            eos_indices_tensor = (t == eos_token_id).nonzero().squeeze()
+            eos_indices_array = eos_indices_tensor.cpu().numpy()
 
             step = 0 # -> index of eos_indices_array
             i = 0 # -> output array
@@ -641,8 +636,8 @@ class GPT2Model(GPT2PreTrainedModel):
         length = input_ids.shape[-1]
         for batch_id in range(input_ids.shape[0]):
             t = input_ids[batch_id]
-            eos_indices_tensor = (t == eos_token_id).nonzero().squeeze(dim=0)
-            eos_indices_array = eos_indices_tensor.numpy()
+            eos_indices_tensor = (t == eos_token_id).nonzero().squeeze()
+            eos_indices_array = eos_indices_tensor.cpu().numpy()
 
             step = 0 # -> index of eos_indices_array
             i = 0 # -> output array
@@ -674,8 +669,8 @@ class GPT2Model(GPT2PreTrainedModel):
         length = input_ids.shape[-1]
         for batch_id in range(input_ids.shape[0]):
             t = input_ids[batch_id]
-            eos_indices_tensor = (t == eos_token_id).nonzero().squeeze(dim=0)
-            eos_indices_array = eos_indices_tensor.numpy()
+            eos_indices_tensor = (t == eos_token_id).nonzero().squeeze()
+            eos_indices_array = eos_indices_tensor.cpu().numpy()
 
             step = 0 # -> index of eos_indices_array
             i = 0 # -> output array
@@ -757,11 +752,12 @@ class GPT2Model(GPT2PreTrainedModel):
             position_ids = torch.arange(past_length, input_shape[-1] + past_length, dtype=torch.long, device=device)
             position_ids = position_ids.unsqueeze(0).view(-1, input_shape[-1])
 
+        eos_token_id = 50256
 
-        prev_sent_attention_mask=self.get_prev_sent_attention_mask(input_ids, eos_token_id)
-        prev_sent_one_hots=self.get_prev_sent_one_hots(input_ids, eos_token_id)
-        curr_sent_attention_mask=self.get_curr_sent_attention_mask(input_ids, eos_token_id)
-        curr_sent_one_hots=self.get_curr_sent_one_hots(input_ids, eos_token_id)
+        prev_sent_attention_mask=self.get_prev_sent_attention_mask(input_ids, eos_token_id).to(input_ids.device)
+        prev_sent_one_hots=self.get_prev_sent_one_hots(input_ids, eos_token_id).to(input_ids.device)
+        curr_sent_attention_mask=self.get_curr_sent_attention_mask(input_ids, eos_token_id).to(input_ids.device)
+        curr_sent_one_hots=self.get_curr_sent_one_hots(input_ids, eos_token_id).to(input_ids.device)
 
 
         # Attention mask.
@@ -976,7 +972,7 @@ class GPT2LMHeadModel(GPT2PreTrainedModel):
 
         if not return_dict:
             output = (lm_logits,) + transformer_outputs[1:]
-            return ((loss,) + output) if loss is not None else output, hidden_states
+            return ((loss,) + output) if loss is not None else output
 
         return CausalLMOutputWithPast(
             loss=loss,
