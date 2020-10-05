@@ -22,6 +22,8 @@ import warnings
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
+import pdb
+
 import torch
 import torch.nn as nn
 from torch.nn import CrossEntropyLoss
@@ -160,6 +162,34 @@ class Attention(nn.Module):
         self.n_head = self.n_head - len(heads)
         self.pruned_heads = self.pruned_heads.union(heads)
 
+
+    def _attn_weights(self, q, k, v, attention_mask=None, head_mask=None, output_attentions=False):
+        w = torch.matmul(q, k)
+        if self.scale:
+            w = w / (float(v.size(-1)) ** 0.5)
+        nd, ns = w.size(-2), w.size(-1)
+
+        if not self.is_cross_attention:
+            # if only "normal" attention layer implements causal mask
+            mask = self.bias[:, :, ns - nd : ns, :ns]
+            w = torch.where(mask.bool(), w, self.masked_bias.to(w.dtype))
+
+        if attention_mask is not None:
+            print("attention mask shape:", attention_mask.shape)
+            # Apply the attention mask
+            w = w + attention_mask
+
+        w = nn.Softmax(dim=-1)(w)
+        w = self.attn_dropout(w)
+
+        # Mask heads if we want to
+        if head_mask is not None:
+            w = w * head_mask
+
+        # w < change
+        # outputs = [torch.matmul(w, v)]
+        return w
+
     def _attn(self, q, k, v, attention_mask=None, head_mask=None, output_attentions=False):
         w = torch.matmul(q, k)
         if self.scale:
@@ -210,7 +240,13 @@ class Attention(nn.Module):
         encoder_attention_mask=None,
         use_cache=False,
         output_attentions=False,
+        prev_sent_attention_mask=None,
+        prev_sent_one_hots=None,
+        curr_sent_attention_mask=None,
+        curr_sent_one_hots=None
     ):
+        assert(not encoder_hidden_states)
+
         if encoder_hidden_states is not None:
             assert hasattr(
                 self, "q_attn"
@@ -218,12 +254,18 @@ class Attention(nn.Module):
             query = self.q_attn(hidden_states)
             key, value = self.c_attn(encoder_hidden_states).split(self.split_size, dim=2)
             attention_mask = encoder_attention_mask
+            prev_sent_keys, curr_sent_keys = None, None
         else:
             query, key, value = self.c_attn(hidden_states).split(self.split_size, dim=2)
+            _, prev_sent_keys, _ = self.c_attn(torch.matmul(prev_sent_one_hots.float(), hidden_states)).split(self.split_size, dim=2)
+            _, curr_sent_keys, _ = self.c_attn(torch.matmul(curr_sent_one_hots.float(), hidden_states)).split(self.split_size, dim=2)
 
         query = self.split_heads(query)
         key = self.split_heads(key, k=True)
         value = self.split_heads(value)
+        prev_sent_keys = self.split_heads(prev_sent_keys, k=True)
+        curr_sent_keys = self.split_heads(curr_sent_keys, k=True)
+
         if layer_past is not None:
             past_key, past_value = layer_past[0].transpose(-2, -1), layer_past[1]  # transpose back cf below
             key = torch.cat((past_key, key), dim=-1)
@@ -233,15 +275,26 @@ class Attention(nn.Module):
             present = torch.stack((key.transpose(-2, -1), value))  # transpose to have same shapes for stacking
         else:
             present = (None,)
+        """
+        batch matrix multiply
+        sentence_one_hots: bs, sl, sl
+        hidden_states: bs, sl, hs
+        sent_keys: bs, sl, hs
+        """
 
-        attn_outputs = self._attn(query, key, value, attention_mask, head_mask, output_attentions)
-        a = attn_outputs[0]
+        attn_weights = self._attn_weights(query, key, value, attention_mask, head_mask, output_attentions)
+        prev_sent_attn_weights = self._attn_weights(query, prev_sent_keys, value, prev_sent_attention_mask, head_mask, output_attentions)
+        curr_sent_attn_weights = self._attn_weights(query, curr_sent_keys, value, curr_sent_attention_mask, head_mask, output_attentions)
+
+        a = torch.matmul((prev_sent_attn_weights+curr_sent_attn_weights)*attn_weights, value)
+
+        # a = attn_outputs[0]
 
         a = self.merge_heads(a)
         a = self.c_proj(a)
         a = self.resid_dropout(a)
 
-        outputs = [a, present] + attn_outputs[1:]
+        outputs = [a, present] + [attn_weights]
         return outputs  # a, present, (attentions)
 
 
@@ -283,6 +336,10 @@ class Block(nn.Module):
         encoder_attention_mask=None,
         use_cache=False,
         output_attentions=False,
+        prev_sent_attention_mask=None,
+        prev_sent_one_hots=None,
+        curr_sent_attention_mask=None,
+        curr_sent_one_hots=None
     ):
         attn_outputs = self.attn(
             self.ln_1(hidden_states),
@@ -290,10 +347,16 @@ class Block(nn.Module):
             attention_mask=attention_mask,
             head_mask=head_mask,
             use_cache=use_cache,
-            output_attentions=output_attentions,
+            output_attentions=True,
+            prev_sent_attention_mask=prev_sent_attention_mask,
+            prev_sent_one_hots=prev_sent_one_hots,
+            curr_sent_attention_mask=curr_sent_attention_mask,
+            curr_sent_one_hots=curr_sent_one_hots
         )
+
         attn_output = attn_outputs[0]  # output_attn: a, present, (attentions)
         outputs = attn_outputs[1:]
+
         # residual connection
         hidden_states = attn_output + hidden_states
 
@@ -496,6 +559,144 @@ class GPT2Model(GPT2PreTrainedModel):
         output_type=BaseModelOutputWithPast,
         config_class=_CONFIG_FOR_DOC,
     )
+
+    def get_prev_sent_attention_mask(self, input_ids, eos_token_id):
+        """
+        Returns, for every token, mask for the prev sentences
+        of the curr token
+        """
+        assert len(input_ids.shape) == 2
+
+        all_data = []
+        length = input_ids.shape[-1]
+        for batch_id in range(input_ids.shape[0]):
+            t = input_ids[batch_id]
+            print("t:", t)
+            print("eos:", eos_token_id)
+            eos_indices_tensor = (t == eos_token_id).nonzero().squeeze(dim=0)
+            eos_indices_array = eos_indices_tensor.numpy()
+            print("array:", eos_indices_tensor)
+
+            step = 0 # -> index of eos_indices_array
+            i = 0 # -> output array
+            next_array = []
+            while i < length and step < len(eos_indices_array):
+                if i <= eos_indices_array[step]:
+                    next_array.append([int(j<=eos_indices_array[step]) for j in range(length)])
+                    i+=1
+                else:
+                    step+=1
+            next_array = next_array + [[int(j<=eos_indices_array[-1]) for j in range(length)] for _ in range(length - len(next_array))]
+            print(next_array)
+
+            all_data.append(next_array)
+
+#         next_array = torch.nn.functional.one_hot(torch.tensor(all_data), length)
+        next_array = torch.tensor(all_data)
+        assert next_array.shape == (input_ids.shape[0], input_ids.shape[1], input_ids.shape[1])
+
+        return next_array
+
+    def get_prev_sent_one_hots(self, input_ids, eos_token_id):
+        """
+        Returns, for every token, one-hot vector for the index
+        of the eos of that sentence
+        """
+        assert len(input_ids.shape) == 2
+
+        all_data = []
+        length = input_ids.shape[-1]
+        for batch_id in range(input_ids.shape[0]):
+            t = input_ids[batch_id]
+            eos_indices_tensor = (t == eos_token_id).nonzero().squeeze(dim=0)
+            eos_indices_array = eos_indices_tensor.numpy()
+
+            step = 0 # -> index of eos_indices_array
+            i = 0 # -> output array
+            next_array = []
+            while i < length and step < len(eos_indices_array):
+                if i <= eos_indices_array[step]:
+                    next_array.append(eos_indices_array[step])
+                    i+=1
+                else:
+                    step+=1
+
+            next_array = next_array + [eos_indices_array[-1] for _ in range(length - len(next_array))]
+
+            all_data.append(next_array)
+
+        next_array = torch.nn.functional.one_hot(torch.tensor(all_data), length)
+        assert next_array.shape == (input_ids.shape[0], input_ids.shape[1], input_ids.shape[1])
+
+        return next_array
+
+    def get_curr_sent_one_hots(self, input_ids, eos_token_id):
+        """
+        Returns, for every token, one-hot vector for the index
+        of the curr token of that sentence
+        """
+        assert len(input_ids.shape) == 2
+
+        all_data = []
+        length = input_ids.shape[-1]
+        for batch_id in range(input_ids.shape[0]):
+            t = input_ids[batch_id]
+            eos_indices_tensor = (t == eos_token_id).nonzero().squeeze(dim=0)
+            eos_indices_array = eos_indices_tensor.numpy()
+
+            step = 0 # -> index of eos_indices_array
+            i = 0 # -> output array
+            next_array = []
+            while i < length and step < len(eos_indices_array):
+                if i <= eos_indices_array[step]:
+                    next_array.append(i)
+                    i+=1
+                else:
+                    step+=1
+
+            next_array = next_array + [eos_indices_array[-1] for _ in range(length - len(next_array))]
+
+            all_data.append(next_array)
+
+        next_array = torch.nn.functional.one_hot(torch.tensor(all_data), length)
+        assert next_array.shape == (input_ids.shape[0], input_ids.shape[1], input_ids.shape[1])
+
+        return next_array
+
+    def get_curr_sent_attention_mask(self, input_ids, eos_token_id):
+        """
+        Returns, for every token, mask for the curr sentence
+        of the curr token of that sentence
+        """
+        assert len(input_ids.shape) == 2
+
+        all_data = []
+        length = input_ids.shape[-1]
+        for batch_id in range(input_ids.shape[0]):
+            t = input_ids[batch_id]
+            eos_indices_tensor = (t == eos_token_id).nonzero().squeeze(dim=0)
+            eos_indices_array = eos_indices_tensor.numpy()
+
+            step = 0 # -> index of eos_indices_array
+            i = 0 # -> output array
+            next_array = []
+
+            while i < length and step < len(eos_indices_array):
+                if i <= eos_indices_array[step]:
+                    next_array.append([int((step!=0 and j<=i and j>eos_indices_array[step-1]) or (step==0 and j<=i)) for j in range(length)])
+                    i+=1
+                else:
+                    step+=1
+            next_array = next_array + [[0 for _ in range(length)] for _ in range(length - len(next_array))]
+
+            all_data.append(next_array)
+
+#         next_array = torch.nn.functional.one_hot(torch.tensor(all_data), length)
+        next_array = torch.tensor(all_data)
+        assert next_array.shape == (input_ids.shape[0], input_ids.shape[1], input_ids.shape[1])
+
+        return next_array
+
     def forward(
         self,
         input_ids=None,
@@ -511,6 +712,7 @@ class GPT2Model(GPT2PreTrainedModel):
         output_attentions=None,
         output_hidden_states=None,
         return_dict=None,
+        eos_token_id=None,
         **kwargs,
     ):
         if "past" in kwargs:
@@ -555,6 +757,13 @@ class GPT2Model(GPT2PreTrainedModel):
             position_ids = torch.arange(past_length, input_shape[-1] + past_length, dtype=torch.long, device=device)
             position_ids = position_ids.unsqueeze(0).view(-1, input_shape[-1])
 
+
+        prev_sent_attention_mask=self.get_prev_sent_attention_mask(input_ids, eos_token_id)
+        prev_sent_one_hots=self.get_prev_sent_one_hots(input_ids, eos_token_id)
+        curr_sent_attention_mask=self.get_curr_sent_attention_mask(input_ids, eos_token_id)
+        curr_sent_one_hots=self.get_curr_sent_one_hots(input_ids, eos_token_id)
+
+
         # Attention mask.
         if attention_mask is not None:
             assert batch_size > 0, "batch_size has to be defined and > 0"
@@ -573,6 +782,19 @@ class GPT2Model(GPT2PreTrainedModel):
             # effectively the same as removing these entirely.
             attention_mask = attention_mask.to(dtype=next(self.parameters()).dtype)  # fp16 compatibility
             attention_mask = (1.0 - attention_mask) * -10000.0
+
+        if prev_sent_attention_mask is not None and curr_sent_attention_mask is not None:
+            assert batch_size > 0, "batch_size has to be defined and > 0"
+            # prev_sent_attention_mask = prev_sent_attention_mask.view(batch_size, -1)
+            prev_sent_attention_mask = prev_sent_attention_mask[:, None, :, :]
+            prev_sent_attention_mask = prev_sent_attention_mask.to(dtype=next(self.parameters()).dtype)  # fp16 compatibility
+            prev_sent_attention_mask = (1.0 - prev_sent_attention_mask) * -10000.0
+
+            # curr_sent_attention_mask = curr_sent_attention_mask.view(batch_size, -1)
+            curr_sent_attention_mask = curr_sent_attention_mask[:, None, :, :]
+            curr_sent_attention_mask = curr_sent_attention_mask.to(dtype=next(self.parameters()).dtype)  # fp16 compatibility
+            curr_sent_attention_mask = (1.0 - curr_sent_attention_mask) * -10000.0
+
 
         # If a 2D ou 3D attention mask is provided for the cross-attention
         # we need to make broadcastabe to [batch_size, num_heads, seq_length, seq_length]
@@ -606,6 +828,7 @@ class GPT2Model(GPT2PreTrainedModel):
         presents = () if use_cache else None
         all_attentions = () if output_attentions else None
         all_hidden_states = () if output_hidden_states else None
+
         for i, (block, layer_past) in enumerate(zip(self.h, past_key_values)):
             if output_hidden_states:
                 all_hidden_states = all_hidden_states + (hidden_states.view(*output_shape),)
@@ -619,6 +842,10 @@ class GPT2Model(GPT2PreTrainedModel):
                 encoder_attention_mask=encoder_attention_mask,
                 use_cache=use_cache,
                 output_attentions=output_attentions,
+                prev_sent_attention_mask=prev_sent_attention_mask,
+                prev_sent_one_hots=prev_sent_one_hots,
+                curr_sent_attention_mask=curr_sent_attention_mask,
+                curr_sent_one_hots=curr_sent_one_hots
             )
 
             hidden_states, present = outputs[:2]
@@ -664,7 +891,7 @@ class GPT2LMHeadModel(GPT2PreTrainedModel):
     def get_output_embeddings(self):
         return self.lm_head
 
-    def prepare_inputs_for_generation(self, input_ids, past=None, **kwargs):
+    def prepare_inputs_for_generation(self, input_ids, past=None, eos_token_id=None, **kwargs):
         # only last token for inputs_ids if past is defined in kwargs
         if past:
             input_ids = input_ids[:, -1].unsqueeze(-1)
@@ -673,6 +900,7 @@ class GPT2LMHeadModel(GPT2PreTrainedModel):
             "input_ids": input_ids,
             "past_key_values": past,
             "use_cache": kwargs.get("use_cache"),
+            "eos_token_id":eos_token_id
         }
 
     @add_start_docstrings_to_callable(GPT2_INPUTS_DOCSTRING)
@@ -698,6 +926,7 @@ class GPT2LMHeadModel(GPT2PreTrainedModel):
         output_attentions=None,
         output_hidden_states=None,
         return_dict=None,
+        eos_token_id=None,
         **kwargs,
     ):
         r"""
@@ -731,9 +960,9 @@ class GPT2LMHeadModel(GPT2PreTrainedModel):
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
+            eos_token_id=eos_token_id
         )
         hidden_states = transformer_outputs[0]
-
         lm_logits = self.lm_head(hidden_states)
 
         loss = None
@@ -747,7 +976,7 @@ class GPT2LMHeadModel(GPT2PreTrainedModel):
 
         if not return_dict:
             output = (lm_logits,) + transformer_outputs[1:]
-            return ((loss,) + output) if loss is not None else output
+            return ((loss,) + output) if loss is not None else output, hidden_states
 
         return CausalLMOutputWithPast(
             loss=loss,
