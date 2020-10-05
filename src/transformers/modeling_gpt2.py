@@ -570,7 +570,7 @@ class GPT2Model(GPT2PreTrainedModel):
         length = input_ids.shape[-1]
         for batch_id in range(input_ids.shape[0]):
             t = input_ids[batch_id]
-            eos_indices_tensor = (t == eos_token_id).nonzero().squeeze()
+            eos_indices_tensor = (t == eos_token_id).nonzero().squeeze(dim=1)
             eos_indices_array = eos_indices_tensor.cpu().numpy().tolist() + [len(input_ids[batch_id]) - 1]
 
             step = 0 # -> index of eos_indices_array
@@ -603,7 +603,7 @@ class GPT2Model(GPT2PreTrainedModel):
         length = input_ids.shape[-1]
         for batch_id in range(input_ids.shape[0]):
             t = input_ids[batch_id]
-            eos_indices_tensor = (t == eos_token_id).nonzero().squeeze()
+            eos_indices_tensor = (t == eos_token_id).nonzero().squeeze(dim=1)
             eos_indices_array = eos_indices_tensor.cpu().numpy().tolist() + [len(input_ids[batch_id]) - 1]
 
             step = 0 # -> index of eos_indices_array
@@ -636,7 +636,7 @@ class GPT2Model(GPT2PreTrainedModel):
         length = input_ids.shape[-1]
         for batch_id in range(input_ids.shape[0]):
             t = input_ids[batch_id]
-            eos_indices_tensor = (t == eos_token_id).nonzero().squeeze()
+            eos_indices_tensor = (t == eos_token_id).nonzero().squeeze(dim=1)
             eos_indices_array = eos_indices_tensor.cpu().numpy().tolist() + [len(input_ids[batch_id]) - 1]
 
             step = 0 # -> index of eos_indices_array
@@ -669,7 +669,7 @@ class GPT2Model(GPT2PreTrainedModel):
         length = input_ids.shape[-1]
         for batch_id in range(input_ids.shape[0]):
             t = input_ids[batch_id]
-            eos_indices_tensor = (t == eos_token_id).nonzero().squeeze()
+            eos_indices_tensor = (t == eos_token_id).nonzero().squeeze(dim=1)
             eos_indices_array = eos_indices_tensor.cpu().numpy().tolist() + [len(input_ids[batch_id]) - 1]
 
             step = 0 # -> index of eos_indices_array
