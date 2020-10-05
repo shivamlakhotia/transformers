@@ -527,7 +527,7 @@ class GenerationMixin:
                 input_ids, past=past, attention_mask=attention_mask, use_cache=use_cache, **model_specific_kwargs
             )
 
-            outputs = self(**model_inputs)
+            outputs, hidden_states = self(**model_inputs)
             next_token_logits = outputs[0][:, -1, :]
 
             scores = self.postprocess_next_token_scores(
@@ -590,7 +590,7 @@ class GenerationMixin:
                     [attention_mask, attention_mask.new_ones((attention_mask.shape[0], 1))], dim=-1
                 )
 
-        return input_ids
+        return input_ids, None, hidden_states
 
     def _generate_beam_search(
         self,
